@@ -10,8 +10,8 @@ namespace InverterTelegram;
 
 public class Worker : BackgroundService
 {
-    private readonly string TelegramBotId = "2077016889:AAHl3acUUJdz1WouGWaIVqAGydlqLGr1Z4M";
-    private readonly long TelegramGroupId = -1001545346113;
+    private string TelegramBotId;
+    private long TelegramGroupId;
     private readonly ILogger<Worker> _logger;
     private readonly IConfiguration _config;
     private string currentStatus = "Line";
@@ -22,6 +22,8 @@ public class Worker : BackgroundService
     {
         _logger = logger;
         _config = config;
+        TelegramBotId = _config.GetValue<string>("TelegramBotId");
+        TelegramGroupId = _config.GetValue<long>("TelegramGroupId");
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -48,7 +50,7 @@ public class Worker : BackgroundService
         await botClient.SetMyCommandsAsync(new List<BotCommand> { batteryCommand, infoCommand, statusCommand });
 
         _logger.LogDebug(
-          $"Hello, World! I am user {me.Id} and my name is {me.FirstName}."
+          $"Hello, World! I am user {me.Username} and my name is {me.FirstName}."
         );
 
         var factory = new ConnectionFactory();
@@ -79,6 +81,7 @@ public class Worker : BackgroundService
                     {
                         if (status.Mode != currentStatus)
                         {
+                            _logger.LogInformation($"Status change: {currentStatus} => {status.Mode}");
                             currentStatus = status.Mode;
                             await botClient.SendTextMessageAsync(TelegramGroupId, $"Inverter Status Change={currentStatus}");
                         }
@@ -91,7 +94,7 @@ public class Worker : BackgroundService
                     var updates = await botClient.GetUpdatesAsync(lastUpdateId);
                     foreach (var update in updates)
                     {
-                        _logger.LogInformation($"Telegram Update: {update.Id} - {update.Type}");
+                        _logger.LogDebug($"Telegram Update: {update.Id} - {update.Type}");
                         switch (update.Type)
                         {
                             case UpdateType.Message:
@@ -100,11 +103,11 @@ public class Worker : BackgroundService
                                     break;
                                 }
 
-                                _logger.LogInformation($"Message received: {update.Message.Text}");
+                                _logger.LogDebug($"Message received: {update.Message.Text}");
                                 var cmd = update.Message.Text.ToLower();
-                                if (cmd.Contains("@schocke_inverter_bot"))
+                                if (cmd.Contains($"@{me.Username}"))
                                 {
-                                    cmd = cmd.Replace("@schocke_inverter_bot", "");
+                                    cmd = cmd.Replace($"@{me.Username}", "");
                                 }
                                 switch (cmd)
                                 {
