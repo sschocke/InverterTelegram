@@ -157,12 +157,17 @@ public class Worker : BackgroundService
     private async Task SendInfoReply(TelegramBotClient botClient, Update update)
     {
         var reply = "Unknown Status";
-        if (current != null) {
+        if (current != null)
+        {
+            var onBattery = current.Mode.ToLower() == "battery";
             var lineStatus = $"Online status: {current.Mode}";
             var acIn = $"AC Input: {current.GridVoltage}V {current.GridFrequency}Hz";
             var output = $"Output: {current.OutputVoltage}V {current.OutputFrequency}Hz";
-            var battery = $"Battery: {current.BatteryCapacity}% {current.BatteryVoltage}V";
-            reply = $"{lineStatus}\r\n{acIn}\r\n{output}\r\n{battery}";
+            var load = $"Load: {current.LoadPercentage}% {current.LoadWatt}W";
+            var battDischarge = $"Discharging: {current.BatteryDischargeCurrent}A";
+            var battCharge = $"Charging: {current.BatteryChargeCurrent}A";
+            var battery = $"Battery: {current.BatteryCapacity}% {current.BatteryVoltage}V ({(onBattery ? battDischarge : battCharge)})";
+            reply = $"{lineStatus}\r\n{load}\r\n{acIn}\r\n{output}\r\n{battery}";
         }
         await botClient.SendTextMessageAsync(
             update.Message.Chat.Id,
