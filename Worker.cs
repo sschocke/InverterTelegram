@@ -10,13 +10,15 @@ namespace InverterTelegram;
 
 public class Worker : BackgroundService
 {
-    private string TelegramBotId;
-    private long TelegramGroupId;
+    private readonly string TelegramBotId;
+    private readonly long TelegramGroupId;
     private readonly ILogger<Worker> _logger;
     private readonly IConfiguration _config;
-    private string currentStatus = "Line";
+    private string currentMode = "Line";
     private InverterMon.InverterStatus? current = null;
     private int lastUpdateId = 0;
+    private DateTime lastStatusChange = DateTime.MinValue;
+    private bool inverterMonOnline = false;
 
     public Worker(ILogger<Worker> logger, IConfiguration config)
     {
@@ -29,9 +31,7 @@ public class Worker : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var botClient = new TelegramBotClient(TelegramBotId);
-        var me = await botClient.GetMeAsync();
-        // botClient.StartReceiving();
-        // botClient.OnMessage += BotMessage;
+        var me = await botClient.GetMeAsync(stoppingToken);
         var batteryCommand = new BotCommand()
         {
             Command = "/battery",
@@ -47,114 +47,123 @@ public class Worker : BackgroundService
             Command = "/info",
             Description = "Returns summary of current data"
         };
-        await botClient.SetMyCommandsAsync(new List<BotCommand> { batteryCommand, infoCommand, statusCommand });
+        await botClient.SetMyCommandsAsync(new List<BotCommand> { batteryCommand, infoCommand, statusCommand }, stoppingToken);
 
         _logger.LogDebug(
-          $"Hello, World! I am user {me.Username} and my name is {me.FirstName}."
+          "Hello, World! I am user {Username} and my name is {FirstName}.",
+          me.Username,
+          me.FirstName
         );
 
-        var factory = new ConnectionFactory();
-        factory.HostName = _config.GetValue<string>("MQHost");
-        factory.UserName = _config.GetValue<string>("MQUser");
-        factory.Password = _config.GetValue<string>("MQPassword");
-        factory.VirtualHost = "/";
-
-        using (var mq = factory.CreateConnection())
+        var factory = new ConnectionFactory
         {
-            using (var channel = mq.CreateModel())
+            HostName = _config.GetValue<string>("MQHost"),
+            UserName = _config.GetValue<string>("MQUser"),
+            Password = _config.GetValue<string>("MQPassword"),
+            VirtualHost = "/"
+        };
+
+        using var mq = factory.CreateConnection();
+        using var channel = mq.CreateModel();
+
+        channel.ExchangeDeclare("inverter", ExchangeType.Topic, false, false);
+
+        var queue = channel.QueueDeclare().QueueName;
+        channel.QueueBind(queue, "inverter", "status");
+
+        var consumer = new EventingBasicConsumer(channel);
+        consumer.Received += async (model, ea) =>
+        {
+            var body = ea.Body.ToArray();
+            var message = Encoding.UTF8.GetString(body);
+            var routingKey = ea.RoutingKey;
+            _logger.LogDebug(" [x] Received '{RoutingKey}':'{Message}'", routingKey, message);
+
+            var status = JsonSerializer.Deserialize<InverterMon.InverterStatus>(message);
+            if (status != null)
             {
-                channel.ExchangeDeclare("inverter", ExchangeType.Topic, false, false);
-
-                var queue = channel.QueueDeclare().QueueName;
-                channel.QueueBind(queue, "inverter", "status");
-
-                var consumer = new EventingBasicConsumer(channel);
-                consumer.Received += async (model, ea) =>
+                if (status.Mode != currentMode)
                 {
-                    var body = ea.Body.ToArray();
-                    var message = Encoding.UTF8.GetString(body);
-                    var routingKey = ea.RoutingKey;
-                    _logger.LogDebug($" [x] Received '{routingKey}':'{message}'");
+                    _logger.LogInformation("Status change: {PreviousMode} => {CurrentMode}", currentMode, status.Mode);
+                    currentMode = status.Mode;
+                    await botClient.SendTextMessageAsync(TelegramGroupId, $"Inverter Status Change={currentMode}");
+                }
+                current = status;
 
-                    var status = JsonSerializer.Deserialize<InverterMon.InverterStatus>(message);
-                    if (status != null)
-                    {
-                        if (status.Mode != currentStatus)
+                if (!inverterMonOnline)
+                {
+                    await botClient.SendTextMessageAsync(TelegramGroupId, "Inverter Monitor Online");
+                }
+                lastStatusChange = DateTime.Now;
+                inverterMonOnline = true;
+            }
+        };
+        channel.BasicConsume(queue, true, consumer);
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            var updates = await botClient.GetUpdatesAsync(lastUpdateId, cancellationToken: stoppingToken);
+            foreach (var update in updates)
+            {
+                _logger.LogDebug("Telegram Update: {UpdateId} - {UpdateType}", update.Id, update.Type);
+                switch (update.Type)
+                {
+                    case UpdateType.Message:
+                        if (update.Message.Type != MessageType.Text || !update.Message.Text.StartsWith("/"))
                         {
-                            _logger.LogInformation($"Status change: {currentStatus} => {status.Mode}");
-                            currentStatus = status.Mode;
-                            await botClient.SendTextMessageAsync(TelegramGroupId, $"Inverter Status Change={currentStatus}");
+                            break;
                         }
-                        current = status;
-                    }
-                };
-                channel.BasicConsume(queue, true, consumer);
-                while (!stoppingToken.IsCancellationRequested)
-                {
-                    var updates = await botClient.GetUpdatesAsync(lastUpdateId);
-                    foreach (var update in updates)
-                    {
-                        _logger.LogDebug($"Telegram Update: {update.Id} - {update.Type}");
-                        switch (update.Type)
-                        {
-                            case UpdateType.Message:
-                                if (update.Message.Type != MessageType.Text || !update.Message.Text.StartsWith("/"))
-                                {
-                                    break;
-                                }
 
-                                _logger.LogDebug($"Message received: {update.Message.Text}");
-                                var cmd = update.Message.Text.ToLower();
-                                if (cmd.Contains($"@{me.Username}"))
-                                {
-                                    cmd = cmd.Replace($"@{me.Username}", "");
-                                }
-                                switch (cmd)
-                                {
-                                    case "/battery":
-                                        await SendBatteryReply(botClient, update);
-                                        break;
-                                    case "/status":
-                                        await SendStatusReply(botClient, update);
-                                        break;
-                                    case "/info":
-                                        await SendInfoReply(botClient, update);
-                                        break;
-                                }
+                        _logger.LogDebug("Message received: {Message}", update.Message.Text);
+                        var cmd = update.Message.Text.ToLower();
+                        if (cmd.Contains($"@{me.Username}"))
+                        {
+                            cmd = cmd.Replace($"@{me.Username}", "");
+                        }
+                        switch (cmd)
+                        {
+                            case "/battery":
+                                await SendBatteryReply(botClient, update, stoppingToken);
+                                break;
+                            case "/status":
+                                await SendStatusReply(botClient, update, stoppingToken);
+                                break;
+                            case "/info":
+                                await SendInfoReply(botClient, update, stoppingToken);
                                 break;
                         }
-                    }
-                    if (updates.Any())
-                    {
-                        lastUpdateId = updates.Max(update => update.Id) + 1;
-                    }
-                    // _logger.LogInformation("Worker running at: {time}", DateTimeOffset.Now);
-                    await Task.Delay(1000, stoppingToken);
+                        break;
                 }
-
-                channel.Close();
-                mq.Close();
             }
+
+            if (updates.Any())
+            {
+                lastUpdateId = updates.Max(update => update.Id) + 1;
+            }
+
+            if (lastStatusChange < DateTime.Now.AddMinutes(-5) && inverterMonOnline)
+            {
+                inverterMonOnline = false;
+                await botClient.SendTextMessageAsync(TelegramGroupId, "Inverter Monitor Offline", cancellationToken: stoppingToken);
+            }
+
+            await Task.Delay(1000, stoppingToken);
         }
+
+        channel.Close();
+        mq.Close();
     }
 
-    private async Task SendBatteryReply(TelegramBotClient botClient, Update update)
+    private async Task SendBatteryReply(TelegramBotClient botClient, Update update, CancellationToken stoppingToken)
     {
-        var reply = current != null ? $"Battery at {current.BatteryCapacity}%" : "Unknown Battery Status";
-        await botClient.SendTextMessageAsync(
-            update.Message.Chat.Id,
-            reply,
-            replyToMessageId: update.Message.MessageId);
+        var reply = current != null ? $"Battery is {current.BatteryCapacity}% at {lastStatusChange}" : "Unknown Battery Status";
+        await botClient.SendTextMessageAsync(update.Message.Chat.Id, reply, replyToMessageId: update.Message.MessageId, cancellationToken: stoppingToken);
     }
-    private async Task SendStatusReply(TelegramBotClient botClient, Update update)
+    private async Task SendStatusReply(TelegramBotClient botClient, Update update, CancellationToken stoppingToken)
     {
-        var reply = current != null ? $"Online status {current.Mode}" : "Unknown Status";
-        await botClient.SendTextMessageAsync(
-            update.Message.Chat.Id,
-            reply,
-            replyToMessageId: update.Message.MessageId);
+        var reply = current != null ? $"Online status {current.Mode} at {lastStatusChange}" : "Unknown Status";
+        await botClient.SendTextMessageAsync(update.Message.Chat.Id, reply, replyToMessageId: update.Message.MessageId, cancellationToken: stoppingToken);
     }
-    private async Task SendInfoReply(TelegramBotClient botClient, Update update)
+    private async Task SendInfoReply(TelegramBotClient botClient, Update update, CancellationToken stoppingToken)
     {
         var reply = "Unknown Status";
         if (current != null)
@@ -167,11 +176,8 @@ public class Worker : BackgroundService
             var battDischarge = $"Discharging: {current.BatteryDischargeCurrent}A";
             var battCharge = $"Charging: {current.BatteryChargeCurrent}A";
             var battery = $"Battery: {current.BatteryCapacity}% {current.BatteryVoltage}V ({(onBattery ? battDischarge : battCharge)})";
-            reply = $"{lineStatus}\r\n{load}\r\n{acIn}\r\n{output}\r\n{battery}";
+            reply = $"Status at {lastStatusChange}\r\n{lineStatus}\r\n{load}\r\n{acIn}\r\n{output}\r\n{battery}";
         }
-        await botClient.SendTextMessageAsync(
-            update.Message.Chat.Id,
-            reply,
-            replyToMessageId: update.Message.MessageId);
+        await botClient.SendTextMessageAsync(update.Message.Chat.Id, reply, replyToMessageId: update.Message.MessageId, cancellationToken: stoppingToken);
     }
 }
