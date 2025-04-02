@@ -101,43 +101,50 @@ public class Worker : BackgroundService
         channel.BasicConsume(queue, true, consumer);
         while (!stoppingToken.IsCancellationRequested)
         {
-            var updates = await botClient.GetUpdatesAsync(lastUpdateId, cancellationToken: stoppingToken);
-            foreach (var update in updates)
+            try
             {
-                _logger.LogDebug("Telegram Update: {UpdateId} - {UpdateType}", update.Id, update.Type);
-                switch (update.Type)
+                var updates = await botClient.GetUpdatesAsync(lastUpdateId, cancellationToken: stoppingToken);
+                foreach (var update in updates)
                 {
-                    case UpdateType.Message:
-                        if (update.Message.Type != MessageType.Text || !update.Message.Text.StartsWith("/"))
-                        {
-                            break;
-                        }
+                    _logger.LogDebug("Telegram Update: {UpdateId} - {UpdateType}", update.Id, update.Type);
+                    switch (update.Type)
+                    {
+                        case UpdateType.Message:
+                            if (update.Message.Type != MessageType.Text || !update.Message.Text.StartsWith("/"))
+                            {
+                                break;
+                            }
 
-                        _logger.LogDebug("Message received: {Message}", update.Message.Text);
-                        var cmd = update.Message.Text.ToLower();
-                        if (cmd.Contains($"@{me.Username}"))
-                        {
-                            cmd = cmd.Replace($"@{me.Username}", "");
-                        }
-                        switch (cmd)
-                        {
-                            case "/battery":
-                                await SendBatteryReply(botClient, update, stoppingToken);
-                                break;
-                            case "/status":
-                                await SendStatusReply(botClient, update, stoppingToken);
-                                break;
-                            case "/info":
-                                await SendInfoReply(botClient, update, stoppingToken);
-                                break;
-                        }
-                        break;
+                            _logger.LogDebug("Message received: {Message}", update.Message.Text);
+                            var cmd = update.Message.Text.ToLower();
+                            if (cmd.Contains($"@{me.Username}"))
+                            {
+                                cmd = cmd.Replace($"@{me.Username}", "");
+                            }
+                            switch (cmd)
+                            {
+                                case "/battery":
+                                    await SendBatteryReply(botClient, update, stoppingToken);
+                                    break;
+                                case "/status":
+                                    await SendStatusReply(botClient, update, stoppingToken);
+                                    break;
+                                case "/info":
+                                    await SendInfoReply(botClient, update, stoppingToken);
+                                    break;
+                            }
+                            break;
+                    }
+                }
+
+                if (updates.Any())
+                {
+                    lastUpdateId = updates.Max(update => update.Id) + 1;
                 }
             }
-
-            if (updates.Any())
+            catch (Exception ex)
             {
-                lastUpdateId = updates.Max(update => update.Id) + 1;
+                _logger.LogError(ex, "Error in Telegram Client");
             }
 
             if (lastStatusChange < DateTime.Now.AddMinutes(-5) && inverterMonOnline)
